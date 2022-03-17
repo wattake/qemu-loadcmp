@@ -523,3 +523,19 @@
  'data': { '*option': 'str' },
  'returns': ['CommandLineOptionInfo'],
  'allow-preconfig': true }
+
+ ##
+ # @hello-world:
+ #
+ # Print a client provided string to the standard output stream.
+ #
+ # @message: string to be printed
+ #
+ # Returns: Nothing on success.
+ #
+ # Notes: if @message is not provided, the "Hello, world" string will
+ #        be printed instead
+ #
+ # Since: <next qemu stable release, eg. 1.0>
+ ##
+ { 'command': 'hello-world', 'data': { '*message': 'str' } }

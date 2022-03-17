@@ -2242,3 +2242,14 @@ void hmp_info_memory_size_summary(Monitor *mon, const QDict *qdict)
     }
     hmp_handle_error(mon, err);
 }
+
+void hmp_hello_world(Monitor *mon, const QDict *qdict)
+{
+    const char *message = qdict_get_try_str(qdict, "message");
+    Error *err = NULL;
+
+    qmp_hello_world(!!message, message, &err);
+    // monitor_printf(mon, "Hello World!\n");
+
+    hmp_handle_error(mon, err);
+}

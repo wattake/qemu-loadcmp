@@ -1742,3 +1742,17 @@ ERST
         .help       = "start a round of guest dirty rate measurement",
         .cmd        = hmp_calc_dirty_rate,
     },
+
+SRST
+``hello-world`` *message*
+  This is my first qmp command referred to writing-qmp-commands.rst.
+  Echo the message if the message exists. Otherwise, echo "Hello World!\n".
+ERST
+
+    {
+        .name       = "hello-world",
+        .args_type  = "message:s?",
+        .params     = "hello-world [message]",
+        .help       = "Print message to the standard output",
+        .cmd        = hmp_hello_world,
+    },
