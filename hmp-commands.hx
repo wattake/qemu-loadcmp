@@ -1756,3 +1756,5 @@ ERST
         .help       = "Print message to the standard output",
         .cmd        = hmp_hello_world,
     },
+
+    
