@@ -352,15 +352,15 @@ void qmp_display_reload(DisplayReloadOptions *arg, Error **errp)
 }
 
 
- void qmp_hello_world(bool has_message, const char *message, Error **errp)
- {
-     if (has_message) {
-         if (strstr(message, "love")) {
-             error_setg(errp, "the word 'love' is not allowed");
-             return;
-         }
-         printf("%s\n", message);
-     } else {
-         printf("Hello World!\n");
-     }
- }
+void qmp_hello_world(bool has_message, const char *message, Error **errp)
+{
+    if (has_message) {
+        if (strstr(message, "love")) {
+            error_setg(errp, "the word 'love' is not allowed");
+            return;
+        }
+        printf("%s\n", message);
+    } else {
+        printf("Hello World!\n");
+    }
+}
