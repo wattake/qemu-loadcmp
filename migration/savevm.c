@@ -3300,3 +3300,308 @@ void qmp_snapshot_delete(const char *job_id,
 
     job_start(&s->common);
 }
+
+
+static int qemu_loadcmp_state_setup(QEMUFile *f)
+{
+    SaveStateEntry *se;
+    int ret;
+
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
+        if (se->is_ram){
+            if (!se->ops || !se->ops->load_setup) {
+                continue;
+            }
+            if (se->ops->is_active) {
+                if (!se->ops->is_active(se->opaque)) {
+                    continue;
+                }
+            }
+            ret = se->ops->load_setup(f, se->opaque);
+            if (ret < 0) {
+                qemu_file_set_error(f, ret);
+                error_report("Load state of device %s failed", se->idstr);
+                return ret;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+
+void qemu_loadcmp_state_cleanup(void)
+{
+    SaveStateEntry *se;
+
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
+        if (se->is_ram && se->ops && se->ops->load_cleanup) {
+            se->ops->load_cleanup(se->opaque);  // ram_load_cleanup
+            break;
+        }
+    }
+}
+
+
+static int cmpstate_load(QEMUFile *f, SaveStateEntry *se, const char *cmp_name)
+{
+    if (se->is_ram && !se->vmsd) {         /* Old style */
+        return ram_loadcmp(f, se->opaque, se->load_version_id, cmp_name);
+    }
+    //return vmstate_load_state(f, se->vmsd, se->opaque, se->load_version_id);
+    return 0;
+}
+
+static int
+qemu_loadcmp_section_part_end(QEMUFile *f, MigrationIncomingState *mis, const char *cmp_name)
+{
+    uint32_t section_id;
+    SaveStateEntry *se;
+    int ret;
+
+    section_id = qemu_get_be32(f);
+
+    ret = qemu_file_get_error(f);
+    if (ret) {
+        error_report("%s: Failed to read section ID: %d",
+                     __func__, ret);
+        return ret;
+    }
+
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
+        if (se->load_section_id == section_id) {
+            break;
+        }
+    }
+    if (se == NULL) {
+        error_report("Unknown savevm section %d", section_id);
+        return -EINVAL;
+    }
+
+    if (se->is_ram){
+        ret = cmpstate_load(f, se, cmp_name);
+        if (ret < 0) {
+            error_report("error while loading state section id %d(%s)",
+                         section_id, se->idstr);
+            return ret;
+        }
+        if (!check_section_footer(f, se)) {
+            return -EINVAL;
+        }
+    }
+
+    return 0;
+}
+
+
+static int
+qemu_loadcmp_section_start_full(QEMUFile *f, MigrationIncomingState *mis, const char *cmp_name)
+{
+    uint32_t instance_id, version_id, section_id;
+    SaveStateEntry *se;
+    char idstr[256];
+    int ret;
+
+    /* Read section start */
+    section_id = qemu_get_be32(f);
+    if (!qemu_get_counted_string(f, idstr)) {
+        error_report("Unable to read ID string for section %u",
+                     section_id);
+        return -EINVAL;
+    }
+    instance_id = qemu_get_be32(f);
+    version_id = qemu_get_be32(f);
+
+    ret = qemu_file_get_error(f);
+    if (ret) {
+        error_report("%s: Failed to read instance/version ID: %d",
+                     __func__, ret);
+        return ret;
+    }
+
+    /* Find savevm section */
+    se = find_se(idstr, instance_id);
+    if (se == NULL) {
+        error_report("Unknown savevm section or instance '%s' %"PRIu32". "
+                     "Make sure that your current VM setup matches your "
+                     "saved VM setup, including any hotplugged devices",
+                     idstr, instance_id);
+        return -EINVAL;
+    }
+    
+
+    if (se->is_ram){
+        /* Validate version */
+        if (version_id > se->version_id) {
+            error_report("savevm: unsupported version %d for '%s' v%d",
+                         version_id, idstr, se->version_id);
+            return -EINVAL;
+        }
+        se->load_version_id = version_id;
+        se->load_section_id = section_id;
+
+        /* Validate if it is a device's state */
+        if (xen_enabled() && se->is_ram) {
+            error_report("loadvm: %s RAM loading not allowed on Xen", idstr);
+            return -EINVAL;
+        }
+
+        ret = cmpstate_load(f, se, cmp_name);
+        if (ret < 0) {
+            error_report("error while loading state for instance 0x%"PRIx32" of"
+                         " device '%s'", instance_id, idstr);
+            return ret;
+        }
+        if (!check_section_footer(f, se)) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+
+
+
+int qemu_loadcmp_state_main(QEMUFile *f, MigrationIncomingState *mis, const char *cmp_name)
+{
+    uint8_t section_type;
+    int ret = 0;
+
+retry:
+    while (true) {
+        section_type = qemu_get_byte(f);
+
+        if (qemu_file_get_error(f)) {
+            ret = qemu_file_get_error(f);
+            break;
+        }
+
+        switch (section_type) {
+        case QEMU_VM_SECTION_START:
+        case QEMU_VM_SECTION_FULL:
+            ret = qemu_loadcmp_section_start_full(f, mis, cmp_name);
+            if (ret < 0) {
+                goto out;
+            }
+            break;
+        case QEMU_VM_SECTION_PART:
+        case QEMU_VM_SECTION_END:
+            ret = qemu_loadcmp_section_part_end(f, mis, cmp_name);
+            if (ret < 0) {
+                goto out;
+            }
+            break;
+        case QEMU_VM_EOF:
+            /* This is the end of migration */
+            goto out;
+        default:
+            error_report("Unknown savevm section type %d", section_type);
+            ret = -EINVAL;
+            goto out;
+        }
+    }
+
+out:
+    if (ret < 0) {
+        qemu_file_set_error(f, ret);
+
+        /* Cancel bitmaps incoming regardless of recovery */
+        dirty_bitmap_mig_cancel_incoming();
+
+        /*
+         * If we are during an active postcopy, then we pause instead
+         * of bail out to at least keep the VM's dirty data.  Note
+         * that POSTCOPY_INCOMING_LISTENING stage is still not enough,
+         * during which we're still receiving device states and we
+         * still haven't yet started the VM on destination.
+         *
+         * Only RAM postcopy supports recovery. Still, if RAM postcopy is
+         * enabled, canceled bitmaps postcopy will not affect RAM postcopy
+         * recovering.
+         */
+        if (postcopy_state_get() == POSTCOPY_INCOMING_RUNNING &&
+            migrate_postcopy_ram() && postcopy_pause_incoming(mis)) {
+            /* Reset f to point to the newly created channel */
+            f = mis->from_src_file;
+            goto retry;
+        }
+    }
+    return ret;
+
+}
+
+int qemu_loadcmp_state(QEMUFile *f, const char *cmp_name)
+{
+    MigrationIncomingState *mis = migration_incoming_get_current();
+    int ret;
+
+    ret = qemu_loadvm_state_header(f); // use as it is
+    if (ret) {
+        return ret;
+    }
+
+    if (qemu_loadcmp_state_setup(f) != 0) {
+        return -EINVAL;
+    }
+
+    ret = qemu_loadcmp_state_main(f, mis, cmp_name);
+    qemu_event_set(&mis->main_thread_load_event);
+
+    if (mis->have_listen_thread) {
+        /* Listen thread still going, can't clean up yet */
+        return ret;
+    }
+
+    if (ret == 0) {
+        ret = qemu_file_get_error(f);
+    }
+
+    qemu_loadcmp_state_cleanup();
+    
+    return ret;
+}
+
+bool load_cmp_snapshot(const char *name, Error **errp)
+{
+    BlockDriverState *bs_vm_state;
+    // QEMUSnapshotInfo sn;
+    QEMUFile *f;
+    int ret;
+    // AioContext *aio_context;
+    MigrationIncomingState *mis = migration_incoming_get_current();
+
+    bs_vm_state = bdrv_all_find_vmstate_bs(NULL, false, NULL, errp);
+    if (!bs_vm_state) {
+        return false;
+    }
+
+    
+    ret = bdrv_all_goto_snapshot(name, false, NULL, errp);
+    if (ret < 0) {
+        goto err_drain;
+    }
+
+    /* restore the VM state */
+    f = qemu_fopen_bdrv(bs_vm_state, 0);
+    if (!f) {
+        error_setg(errp, "Could not open VM state file");
+        goto err_drain;
+    }
+
+    mis->from_src_file = f;
+
+    ret = qemu_loadcmp_state(f, name);
+    
+ 
+    if (ret < 0) {
+        error_setg(errp, "Error %d while loading VM state", ret);
+        return false;
+    }
+
+    return true;
+
+err_drain:
+    bdrv_drain_all_end();
+    return false;
+}
+

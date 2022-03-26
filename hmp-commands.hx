@@ -1757,4 +1757,19 @@ ERST
         .cmd        = hmp_hello_world,
     },
 
-    
+SRST
+``loadcmp`` *tag*
+  Set the componet of guest OS to the snapshot identified by the tag
+  *tag*.
+
+ERST
+
+    {
+        .name       = "loadcmp",
+        .args_type  = "name:s",
+        .params     = "tag",
+        .help       = "restore a component snapshot from its tag",
+        .cmd        = hmp_loadcmp,
+        .command_completion = loadvm_completion,
+    },
+

@@ -2253,3 +2253,17 @@ void hmp_hello_world(Monitor *mon, const QDict *qdict)
 
     hmp_handle_error(mon, err);
 }
+
+void hmp_loadcmp(Monitor *mon, const QDict *qdict)
+{
+    int saved_vm_running  = runstate_is_running();
+    const char *name = qdict_get_str(qdict, "name");
+    Error *err = NULL;
+
+    vm_stop(RUN_STATE_RESTORE_VM);
+
+    if (load_cmp_snapshot(name, &err) && saved_vm_running) {
+        vm_start();
+    }
+    hmp_handle_error(mon, err);
+}

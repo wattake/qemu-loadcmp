@@ -581,6 +581,36 @@ size_t qemu_get_buffer(QEMUFile *f, uint8_t *buf, size_t size)
 }
 
 /*
+ * Read 'size' bytes of data from the file into buf.
+ * 'size' can be larger than the internal buffer.
+ *
+ * It will return size bytes unless there was an error, in which case it will
+ * return as many as it managed to read (assuming blocking fd's which
+ * all current QEMUFile are)
+ */
+size_t qemu_get_buffer_no_cpy(QEMUFile *f, uint8_t *buf, size_t size)
+{
+    size_t pending = size;
+    size_t done = 0;
+
+    while (pending > 0) {
+        size_t res;
+        uint8_t *src;
+
+        res = qemu_peek_buffer(f, &src, MIN(pending, IO_BUF_SIZE), 0);
+        if (res == 0) {
+            return done;
+        }
+        //memcpy(buf, src, res);
+        qemu_file_skip(f, res);
+        buf += res;
+        pending -= res;
+        done += res;
+    }
+    return done;
+}
+
+/*
  * Read 'size' bytes of data from the file.
  * 'size' can be larger than the internal buffer.
  *

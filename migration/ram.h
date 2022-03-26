@@ -86,4 +86,7 @@ void ram_write_tracking_prepare(void);
 int ram_write_tracking_start(void);
 void ram_write_tracking_stop(void);
 
+/* ram */
+int ram_loadcmp(QEMUFile *f, void *opaque, int version_id, const char *cmp_name);
+
 #endif

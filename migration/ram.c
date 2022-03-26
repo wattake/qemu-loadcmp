@@ -4224,3 +4224,249 @@ void ram_mig_init(void)
     register_savevm_live("ram", 0, 4, &savevm_ram_handlers, &ram_state);
     ram_block_notifier_add(&ram_mig_ram_notifier);
 }
+
+/**
+ * ram_loadcmp_precopy: load pages of components
+ *
+ * Returns 0 for success or -errno in case of error
+ *
+ * Called in precopy mode by ram_load().
+ * rcu_read_lock is taken prior to this being called.
+ *
+ * @f: QEMUFile where to send the data
+ */
+static int ram_loadcmp_precopy(QEMUFile *f, ram_addr_t cmp_addr, size_t cmp_size)
+{
+    int flags = 0, ret = 0, invalid_flags = 0, len = 0, i = 0;
+    /* ADVISE is earlier, it shows the source has the postcopy capability on */
+    bool postcopy_advised = postcopy_is_advised();
+    if (!migrate_use_compression()) {
+        invalid_flags |= RAM_SAVE_FLAG_COMPRESS_PAGE;
+    }
+
+    while (!ret && !(flags & RAM_SAVE_FLAG_EOS)) {
+        ram_addr_t addr, total_ram_bytes;
+        void *host = NULL, *host_bak = NULL;
+        uint8_t ch;
+
+        /*
+         * Yield periodically to let main loop run, but an iteration of
+         * the main loop is expensive, so do it each some iterations
+         */
+        if ((i & 32767) == 0 && qemu_in_coroutine()) {
+            aio_co_schedule(qemu_get_current_aio_context(),
+                            qemu_coroutine_self());
+            qemu_coroutine_yield();
+        }
+        i++;
+
+        addr = qemu_get_be64(f);
+        flags = addr & ~TARGET_PAGE_MASK;
+        addr &= TARGET_PAGE_MASK;
+
+        if (flags & invalid_flags) {
+            if (flags & invalid_flags & RAM_SAVE_FLAG_COMPRESS_PAGE) {
+                error_report("Received an unexpected compressed page");
+            }
+
+            ret = -EINVAL;
+            break;
+        }
+
+        if (flags & (RAM_SAVE_FLAG_ZERO | RAM_SAVE_FLAG_PAGE |
+                     RAM_SAVE_FLAG_COMPRESS_PAGE | RAM_SAVE_FLAG_XBZRLE)) {
+            RAMBlock *block = ram_block_from_stream(f, flags);
+
+            host = host_from_ram_block_offset(block, addr);
+            /*
+             * After going into COLO stage, we should not load the page
+             * into SVM's memory directly, we put them into colo_cache firstly.
+             * NOTE: We need to keep a copy of SVM's ram in colo_cache.
+             * Previously, we copied all these memory in preparing stage of COLO
+             * while we need to stop VM, which is a time-consuming process.
+             * Here we optimize it by a trick, back-up every page while in
+             * migration process while COLO is enabled, though it affects the
+             * speed of the migration, but it obviously reduce the downtime of
+             * back-up all SVM'S memory in COLO preparing stage.
+             */
+            if (migration_incoming_colo_enabled()) {
+                if (migration_incoming_in_colo_state()) {
+                    /* In COLO stage, put all pages into cache temporarily */
+                    host = colo_cache_from_block_offset(block, addr, true);
+                } else {
+                   /*
+                    * In migration stage but before COLO stage,
+                    * Put all pages into both cache and SVM's memory.
+                    */
+                    host_bak = colo_cache_from_block_offset(block, addr, false);
+                }
+            }
+            if (!host) {
+                error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
+                ret = -EINVAL;
+                break;
+            }
+            if (!migration_incoming_in_colo_state()) {
+                ramblock_recv_bitmap_set(block, host);
+            }
+
+            trace_ram_load_loop(block->idstr, (uint64_t)addr, flags, host);
+        }
+
+        switch (flags & ~RAM_SAVE_FLAG_CONTINUE) {
+        case RAM_SAVE_FLAG_MEM_SIZE:
+            /* Synchronize RAM block list */
+            total_ram_bytes = addr;
+            while (!ret && total_ram_bytes) {
+                RAMBlock *block;
+                char id[256];
+                ram_addr_t length;
+
+                len = qemu_get_byte(f);
+                qemu_get_buffer(f, (uint8_t *)id, len);
+                id[len] = 0;
+                length = qemu_get_be64(f);
+
+                block = qemu_ram_block_by_name(id);
+                if (block && !qemu_ram_is_migratable(block)) {
+                    error_report("block %s should not be migrated !", id);
+                    ret = -EINVAL;
+                } else if (block) {
+                    if (length != block->used_length) {
+                        Error *local_err = NULL;
+
+                        ret = qemu_ram_resize(block, length,
+                                              &local_err);
+                        if (local_err) {
+                            error_report_err(local_err);
+                        }
+                    }
+                    /* For postcopy we need to check hugepage sizes match */
+                    if (postcopy_advised && migrate_postcopy_ram() &&
+                        block->page_size != qemu_host_page_size) {
+                        uint64_t remote_page_size = qemu_get_be64(f);
+                        if (remote_page_size != block->page_size) {
+                            error_report("Mismatched RAM page size %s "
+                                         "(local) %zd != %" PRId64,
+                                         id, block->page_size,
+                                         remote_page_size);
+                            ret = -EINVAL;
+                        }
+                    }
+                    if (migrate_ignore_shared()) {
+                        hwaddr addr = qemu_get_be64(f);
+                        if (ramblock_is_ignored(block) &&
+                            block->mr->addr != addr) {
+                            error_report("Mismatched GPAs for block %s "
+                                         "%" PRId64 "!= %" PRId64,
+                                         id, (uint64_t)addr,
+                                         (uint64_t)block->mr->addr);
+                            ret = -EINVAL;
+                        }
+                    }
+                    ram_control_load_hook(f, RAM_CONTROL_BLOCK_REG,
+                                          block->idstr);
+                } else {
+                    error_report("Unknown ramblock \"%s\", cannot "
+                                 "accept migration", id);
+                    ret = -EINVAL;
+                }
+
+                total_ram_bytes -= length;
+            }
+            break;
+
+        case RAM_SAVE_FLAG_ZERO:
+            ch = qemu_get_byte(f);
+            ram_handle_compressed(host, ch, TARGET_PAGE_SIZE);
+            break;
+
+        case RAM_SAVE_FLAG_PAGE:
+            if(cmp_addr<=addr && addr<(cmp_addr+cmp_size)){
+                qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            }else{
+                qemu_get_buffer_no_cpy(f, host, TARGET_PAGE_SIZE);
+            }
+            break;
+
+        case RAM_SAVE_FLAG_COMPRESS_PAGE:
+            len = qemu_get_be32(f);
+            if (len < 0 || len > compressBound(TARGET_PAGE_SIZE)) {
+                error_report("Invalid compressed data length: %d", len);
+                ret = -EINVAL;
+                break;
+            }
+            decompress_data_with_multi_threads(f, host, len);
+            break;
+
+        case RAM_SAVE_FLAG_XBZRLE:
+            if (load_xbzrle(f, addr, host) < 0) {
+                error_report("Failed to decompress XBZRLE page at "
+                             RAM_ADDR_FMT, addr);
+                ret = -EINVAL;
+                break;
+            }
+            break;
+        case RAM_SAVE_FLAG_EOS:
+            /* normal exit */
+            multifd_recv_sync_main();
+            break;
+        default:
+            if (flags & RAM_SAVE_FLAG_HOOK) {
+                ram_control_load_hook(f, RAM_CONTROL_HOOK, NULL);
+            } else {
+                error_report("Unknown combination of migration flags: 0x%x",
+                             flags);
+                ret = -EINVAL;
+            }
+        }
+        if (!ret) {
+            ret = qemu_file_get_error(f);
+        }
+        if (!ret && host_bak) {
+            memcpy(host_bak, host, TARGET_PAGE_SIZE);
+        }
+    }
+
+    ret |= wait_for_decompress_done();
+    return ret;
+}
+
+#define CMP_MAX 16
+static char *cmp_ids[CMP_MAX];
+static unsigned long int cmp_addr_list[CMP_MAX][2];
+
+int ram_loadcmp(QEMUFile *f, void *opaque, int version_id, const char *cmp_name)
+{
+    int ret = 0;
+    int cmp_id;
+
+    if (version_id != 4){
+        return -EINVAL;
+    }
+
+    if(!strcmp(cmp_name,"test")){
+        cmp_ids[0] = (char*)malloc(sizeof(cmp_name));
+        strcpy(cmp_ids[0], cmp_name);
+        cmp_addr_list[0][0] = (ram_addr_t)1327104;
+        cmp_addr_list[0][1] = 1*(size_t)TARGET_PAGE_SIZE;
+    }
+
+    /*
+     * This RCU critical section can be very long running.
+     * When RCU reclaims in the code start to become numerous,
+     * it will be necessary to reduce the granularity of this
+     * critical section.
+     */
+    WITH_RCU_READ_LOCK_GUARD(){
+        for(int i=0; i<(unsigned int)CMP_MAX; i++){
+            if(!strcmp(cmp_name, cmp_ids[i])){
+                cmp_id = i;
+                break;
+            }
+        }
+        ret = ram_loadcmp_precopy(f, cmp_addr_list[cmp_id][0], cmp_addr_list[cmp_id][1]);
+    }
+
+    return ret;
+}

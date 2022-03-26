@@ -133,6 +133,6 @@ void hmp_info_dirty_rate(Monitor *mon, const QDict *qdict);
 void hmp_calc_dirty_rate(Monitor *mon, const QDict *qdict);
 
 void hmp_hello_world(Monitor *mon, const QDict *qdict);
-
+void hmp_loadcmp(Monitor *mon, const QDict *qdict);
 
 #endif

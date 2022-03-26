@@ -68,4 +68,9 @@ int qemu_load_device_state(QEMUFile *f);
 int qemu_savevm_state_complete_precopy_non_iterable(QEMUFile *f,
         bool in_postcopy, bool inactivate_disks);
 
+
+int qemu_loadcmp_state(QEMUFile *f, const char *cmp_name);
+void qemu_loadcmp_state_cleanup(void);
+int qemu_loadcmp_state_main(QEMUFile *f, MigrationIncomingState *mis, const char *cmp_name);
+
 #endif

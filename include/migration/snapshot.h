@@ -61,4 +61,8 @@ bool delete_snapshot(const char *name,
                     bool has_devices, strList *devices,
                     Error **errp);
 
+
+bool load_cmp_snapshot(const char *name,
+                       Error **errp);
+
 #endif
